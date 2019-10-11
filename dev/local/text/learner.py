@@ -8,7 +8,6 @@ from ..test import *
 from ..core import *
 from ..layers import *
 from ..data.all import *
-from ..notebook.showdoc import show_doc
 from ..optimizer import *
 from ..learner import *
 from ..metrics import *
@@ -65,7 +64,7 @@ class RNNLearner(Learner):
     #TODO: When access is easier, grab new_vocab from self.dbunch
     def load_pretrained(self, wgts_fname, vocab_fname, new_vocab, strict=True):
         "Load a pretrained model and adapt it to the data vocabulary."
-        old_vocab = pickle.load(open(vocab_fname, 'rb'))
+        old_vocab = Path(vocab_fname).load()
         wgts = torch.load(wgts_fname, map_location = lambda storage,loc: storage)
         if 'model' in wgts: wgts = wgts['model'] #Just in case the pretrained model was saved with an optimizer
         wgts = match_embeds(wgts, old_vocab, new_vocab)
@@ -93,7 +92,7 @@ def language_model_learner(dbunch, arch, vocab, config=None, drop_mult=1., pretr
             if 'url' not in meta:
                 warn("There are no pretrained weights for that architecture yet!")
                 return learn
-            model_path = untar_data(meta['url'] , c_key=ConfigKey.Model)
+            model_path = untar_data(meta['url'] , c_key='model')
             fnames = [list(model_path.glob(f'*.{ext}'))[0] for ext in ['pth', 'pkl']]
         learn = learn.load_pretrained(*fnames, vocab)
     return learn
@@ -112,8 +111,28 @@ def text_classifier_learner(dbunch, arch, vocab, bptt=72, config=None, pretraine
         if 'url' not in meta:
             warn("There are no pretrained weights for that architecture yet!")
             return learn
-        model_path = untar_data(meta['url'], c_key=ConfigKey.Model)
+        model_path = untar_data(meta['url'], c_key='model')
         fnames = [list(model_path.glob(f'*.{ext}'))[0] for ext in ['pth', 'pkl']]
         learn = learn.load_pretrained(*fnames, vocab, strict=False)
         learn.freeze()
     return learn
+
+#Cell
+from .data import _get_empty_df
+
+@typedispatch
+def show_results(x: LMTensorText, y, its, ctxs=None, max_n=10, **kwargs):
+    if ctxs is None: ctxs = _get_empty_df(min(len(its), max_n))
+    for i,l in enumerate(['input', 'target', 'pred']):
+        ctxs = [b.show(ctx=c, label=l, **kwargs) for b,c,_ in zip(its.itemgot(i),ctxs,range(max_n))]
+    display_df(pd.DataFrame(ctxs))
+    return ctxs
+
+#Cell
+@typedispatch
+def show_results(x: TensorText, y, its, ctxs=None, max_n=10, **kwargs):
+    if ctxs is None: ctxs = _get_empty_df(min(len(its), max_n))
+    for i in range(3):
+        ctxs = [b.show(ctx=c, **kwargs) for b,c,_ in zip(its.itemgot(i),ctxs,range(max_n))]
+    display_df(pd.DataFrame(ctxs))
+    return ctxs
