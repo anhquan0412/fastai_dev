@@ -46,7 +46,8 @@ class Numericalize(Transform):
 class LMDataLoader(TfmdDL):
     def __init__(self, dataset, lens=None, cache=2, bs=64, seq_len=72, num_workers=0, **kwargs):
         super().__init__(dataset=dataset, bs=bs, num_workers=num_workers, **kwargs)
-        self.items = ReindexCollection([(o[0] if isinstance(o, tuple) else o) for o in dataset], cache=cache)
+        self.items = ReindexCollection([(o[0] if isinstance(o, tuple) else o)
+                                        for o in dataset], cache=cache)
         self.seq_len = seq_len
         if lens is None: lens = [len(o) for o in self.items]
         self.lens = ReindexCollection(lens, idxs=self.items.idxs)
