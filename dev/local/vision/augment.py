@@ -124,15 +124,15 @@ def _do_crop_pad(x:Image.Image, sz, tl, orig_sz,
     return x
 
 @patch
-def _do_crop_pad(x:TensorPoint, sz, tl, orig_sz, pad_mode=PadMode.Zeros, **kwargs):
+def _do_crop_pad(x:TensorPoint, sz, tl, orig_sz, pad_mode=PadMode.Zeros, resize_to=None, **kwargs):
     #assert pad_mode==PadMode.Zeros,"Only zero padding is supported for `TensorPoint` and `TensorBBox`"
     orig_sz,sz,tl = map(FloatTensor, (orig_sz,sz,tl))
-    return TensorPoint((x+1)*orig_sz/sz - tl*2/sz - 1)
+    return TensorPoint((x+1)*orig_sz/sz - tl*2/sz - 1, sz=sz if resize_to is None else resize_to)
 
 @patch
-def _do_crop_pad(x:TensorBBox, sz, tl, orig_sz, pad_mode=PadMode.Zeros, **kwargs):
+def _do_crop_pad(x:TensorBBox, sz, tl, orig_sz, pad_mode=PadMode.Zeros, resize_to=None, **kwargs):
     bbox,label = x
-    bbox = TensorPoint._do_crop_pad(bbox.view(-1,2), sz, tl, orig_sz, pad_mode).view(-1,4)
+    bbox = TensorPoint._do_crop_pad(bbox.view(-1,2), sz, tl, orig_sz, pad_mode, resize_to).view(-1,4)
     return TensorBBox(clip_remove_empty(bbox, label))
 
 @patch
@@ -225,7 +225,7 @@ class RandomResizedCrop(CropPad):
 
 #Cell
 def _init_mat(x):
-    mat = torch.eye(3, dtype=x.dtype, device=x.device)
+    mat = torch.eye(3, device=x.device).float()
     return mat.unsqueeze(0).expand(x.size(0), 3, 3).contiguous()
 
 #Cell
@@ -291,7 +291,7 @@ def affine_coord(x: TensorBBox, mat=None, coord_tfm=None, sz=None, mode='nearest
 
 #Cell
 def _prepare_mat(x, mat):
-    h,w = x.shape[-2:]
+    h,w = (x._meta['sz'] if hasattr(x, '_meta') and 'sz' in x._meta else x.shape[-2:])
     mat[:,0,1] *= h/w
     mat[:,1,0] *= w/h
     return mat[:,:2]
@@ -299,7 +299,7 @@ def _prepare_mat(x, mat):
 #Cell
 class AffineCoordTfm(RandTransform):
     "Combine and apply affine and coord transforms"
-    order = 30
+    split_idx,order = None,30
     def __init__(self, aff_fs=None, coord_fs=None, size=None, mode='bilinear', pad_mode=PadMode.Reflection, mode_mask='nearest'):
         self.aff_fs,self.coord_fs = L(aff_fs),L(coord_fs)
         store_attr(self, 'size,mode,pad_mode,mode_mask')
@@ -307,6 +307,7 @@ class AffineCoordTfm(RandTransform):
 
     def before_call(self, b, split_idx):
         if isinstance(b, tuple): b = b[0]
+        self.split_idx = split_idx
         self.do,self.mat = True,self._get_affine_mat(b)
         for t in self.coord_fs: t.before_call(b)
 
@@ -317,13 +318,14 @@ class AffineCoordTfm(RandTransform):
 
     def _get_affine_mat(self, x):
         aff_m = _init_mat(x)
+        if self.split_idx: return _prepare_mat(x, aff_m)
         ms = [f(x) for f in self.aff_fs]
         ms = [m for m in ms if m is not None]
         for m in ms: aff_m = aff_m @ m
         return _prepare_mat(x, aff_m)
 
     def _encode(self, x, mode, reverse=False):
-        coord_func = None if len(self.coord_fs)==0 else partial(compose_tfms, tfms=self.coord_fs, reverse=reverse)
+        coord_func = None if len(self.coord_fs)==0 or self.split_idx else partial(compose_tfms, tfms=self.coord_fs, reverse=reverse)
         return x.affine_coord(self.mat, coord_func, sz=self.size, mode=mode, pad_mode=self.pad_mode)
 
     def encodes(self, x:TensorImage): return self._encode(x, self.mode)
@@ -396,9 +398,9 @@ def dihedral_mat(x, p=0.5, draw=None):
                       ys*m1,  ys*m0,  t0(xs)).float()
 
 #Cell
-#TODO: can't patch ,TensorPoint,TensorBBox because they don't know the size
+#TODO: can't patch TensorBBox because they don't know the size
 @patch
-def dihedral_batch(x: (TensorImage,TensorMask), p=0.5, draw=None, size=None, mode=None, pad_mode=None):
+def dihedral_batch(x: (TensorImage,TensorMask,TensorPoint), p=0.5, draw=None, size=None, mode=None, pad_mode=None):
     x0,mode,pad_mode = _get_default(x, mode, pad_mode)
     mat = _prepare_mat(x, dihedral_mat(x0, p=p, draw=draw))
     return x.affine_coord(mat=mat, sz=size, mode=mode, pad_mode=pad_mode)
@@ -417,10 +419,10 @@ def rotate_mat(x, max_deg=10, p=0.5, draw=None):
                      -thetas.sin(), thetas.cos(), t0(thetas))
 
 #Cell
-#TODO: can't patch ,TensorPoint,TensorBBox because they don't know the size
+#TODO: can't patch TensorBBox because they don't know the size
 @delegates(rotate_mat)
 @patch
-def rotate(x: (TensorImage,TensorMask), size=None, mode=None, pad_mode=None, **kwargs):
+def rotate(x: (TensorImage,TensorMask,TensorPoint), size=None, mode=None, pad_mode=None, **kwargs):
     x0,mode,pad_mode = _get_default(x, mode, pad_mode)
     mat = _prepare_mat(x, rotate_mat(x0, **kwargs))
     return x.affine_coord(mat=mat, sz=size, mode=mode, pad_mode=pad_mode)
@@ -619,7 +621,7 @@ def aug_transforms(do_flip=True, flip_vert=False, max_rotate=10., max_zoom=1.1, 
                    size=None, mode='bilinear', pad_mode=PadMode.Reflection):
     "Utility func to easily create a list of flip, rotate, zoom, warp, lighting transforms."
     res,tkw = [],dict(size=size, mode=mode, pad_mode=pad_mode)
-    if do_flip:    res.append(Dihedral(p=0.5, **tkw) if flip_vert else Flip(p=0.5, **tkw))
+    ifmnist = untar_data(URLs.MNIST_TINY)
     if max_warp:   res.append(Warp(magnitude=max_warp, p=p_affine, **tkw))
     if max_rotate: res.append(Rotate(max_deg=max_rotate, p=p_affine, **tkw))
     if max_zoom>1: res.append(Zoom(max_zoom=max_zoom, p=p_affine, **tkw))

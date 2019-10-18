@@ -125,7 +125,10 @@ def to_np(x):
 
 #Cell
 class TensorBase(Tensor):
-    def __new__(cls, x): return torch.Tensor._make_subclass(cls, tensor(x))
+    def __new__(cls, x, **kwargs):
+        res = torch.Tensor._make_subclass(cls, tensor(x))
+        res._meta = kwargs
+        return res
 
     def __reduce_ex__(self,proto):
         torch.utils.hooks.warn_if_has_hooks(self)
@@ -395,10 +398,14 @@ class ProcessPoolExecutor(concurrent.futures.ProcessPoolExecutor):
         except Exception as e: self.on_exc(e)
 
 #Cell
-def parallel(f, items, *args, n_workers=defaults.cpus, **kwargs):
+def parallel(f, items, *args, n_workers=defaults.cpus, total=None, progress=True, **kwargs):
     "Applies `func` in parallel to `items`, using `n_workers`"
     with ProcessPoolExecutor(n_workers) as ex:
-        return L(progress_bar(ex.map(f,items, *args, **kwargs), total=len(items), leave=False))
+        r = ex.map(f,items, *args, **kwargs)
+        if progress:
+            if total is None: total = len(items)
+            r = progress_bar(r, total=total, leave=False)
+        return L(r)
 
 #Cell
 def run_procs(f, f_done, args):
