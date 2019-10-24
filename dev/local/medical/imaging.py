@@ -39,6 +39,7 @@ def scaled_px(self:DcmDataset):
 
 #Cell
 def array_freqhist_bins(self, n_bins=100):
+    "A numpy based function to split the range of pixel values into groups, such that each group has around the same number of pixels"
     imsd = np.sort(self.flatten())
     t = np.array([0.001])
     t = np.append(t, np.arange(n_bins)/n_bins+(1/2/n_bins))
@@ -49,6 +50,7 @@ def array_freqhist_bins(self, n_bins=100):
 #Cell
 @patch
 def freqhist_bins(self:Tensor, n_bins=100):
+    "A function to split the range of pixel values into groups, such that each group has around the same number of pixels"
     imsd = self.view(-1).sort()[0]
     t = torch.cat([tensor([0.001]),
                    torch.arange(n_bins).float()/n_bins+(1/2/n_bins),
@@ -100,7 +102,7 @@ def windowed(self:DcmDataset, w, l):
 # From https://radiopaedia.org/articles/windowing-ct
 dicom_windows = types.SimpleNamespace(
     brain=(80,40),
-    subdural=(200,80),
+    subdural=(254,100),
     stroke=(8,32),
     brain_bone=(2800,600),
     brain_soft=(375,40),
@@ -116,7 +118,7 @@ dicom_windows = types.SimpleNamespace(
 class TensorCTScan(TensorImageBW): _show_args = {'cmap':'bone'}
 
 #Cell
-class PILCTScan(PILBase): _open_args,_tensor_cls = {},TensorCTScan
+class PILCTScan(PILBase): _open_args,_tensor_cls,_show_args = {},TensorCTScan,TensorCTScan._show_args
 
 #Cell
 @patch
@@ -211,6 +213,28 @@ def crop_resize(x, crops, new_sz):
 def to_uint16(x:(Tensor,DcmDataset), bins=None):
     d = x.hist_scaled(bins).clamp(0,1) * 2**16
     return d.numpy().astype(np.uint16)
+
+#Cell
+@patch
+def to_3chan(x:Tensor, win1, win2, bins=None):
+    return torch.stack([
+        x.windowed(*win1),
+        x.windowed(*win2),
+        x.hist_scaled(bins).clamp(0,1)
+    ])
+
+#Cell
+@patch
+def to_3chan(x:DcmDataset, win1, win2, bins=None):
+    return x.scaled_px.to_3chan(win1, win2, bins)
+
+#Cell
+@patch
+def save_jpg(x:(Tensor,DcmDataset), path, win1, win2, bins=None, quality=90):
+    fn = Path(path).with_suffix('.jpg')
+    x = (x.to_3chan(win1, win2, bins)*255).byte()
+    im = Image.fromarray(x.permute(1,2,0).numpy())
+    im.save(fn, quality=quality)
 
 #Cell
 @patch

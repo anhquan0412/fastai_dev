@@ -68,7 +68,10 @@ class GatherPredsCallback(Callback):
         "Save predictions, targets and potentially losses"
         self.preds.append(to_detach(self.pred))
         self.targets.append(to_detach(self.yb))
-        if self.with_loss:  self.losses.append(to_detach(self.loss))
+        if self.with_loss:
+            bs = find_bs(self.yb)
+            loss = self.loss if self.loss.numel() == bs else self.loss.view(bs,-1).mean(1)
+            self.losses.append(to_detach(loss))
 
 #Cell
 _ex_docs = dict(
@@ -121,7 +124,8 @@ def save_model(file, model, opt, with_opt=True):
 def load_model(file, model, opt, with_opt=None, device=None, strict=True):
     "Load `model` from `file` along with `opt` (if available, and if `with_opt`)"
     if isinstance(device, int): device = torch.device('cuda', device)
-    state = torch.load(file)
+    elif device is None: device = 'cpu'
+    state = torch.load(file, map_location=device)
     hasopt = set(state)=={'model', 'opt'}
     model_state = state['model'] if hasopt else state
     get_model(model).load_state_dict(model_state, strict=strict)
@@ -130,6 +134,13 @@ def load_model(file, model, opt, with_opt=None, device=None, strict=True):
         except:
             if with_opt: warn("Could not load the optimizer state.")
     elif with_opt: warn("Saved filed doesn't contain an optimizer state.")
+
+#Cell
+def _try_concat(o):
+    try:
+        return torch.cat(o)
+    except:
+        return sum([L(o_[i,:] for i in range_of(o_)) for o_ in o], L())
 
 #Cell
 class Learner():
@@ -266,7 +277,7 @@ class Learner():
             preds = act(torch.cat(cb.preds))
             res = (preds, detuplify(tuple(torch.cat(o) for o in zip(*cb.targets))))
             if with_decoded: res = res + (getattr(self.loss_func, 'decodes', noop)(preds),)
-            if with_input: res = (tuple(torch.cat(o) for o in zip(*cb.inputs)),) + res
+            if with_input: res = (tuple(_try_concat(o) for o in zip(*cb.inputs)),) + res
             if with_loss:  res = res + (torch.cat(cb.losses),)
             return res
 
