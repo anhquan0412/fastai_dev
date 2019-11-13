@@ -19,8 +19,9 @@ import sklearn.metrics as skm
 #Cell
 class AccumMetric(Metric):
     "Stores predictions and targets on CPU in accumulate to perform final calculations with `func`."
-    def __init__(self, func, dim_argmax=None, sigmoid=False, thresh=None, to_np=False, invert_arg=False, **kwargs):
-        self.func,self.dim_argmax,self.sigmoid,self.thresh = func,dim_argmax,sigmoid,thresh
+    def __init__(self, func, dim_argmax=None, sigmoid=False, thresh=None, to_np=False, invert_arg=False,
+                 flatten=True, **kwargs):
+        store_attr(self,'func,dim_argmax,sigmoid,thresh,flatten')
         self.to_np,self.invert_args,self.kwargs = to_np,invert_arg,kwargs
 
     def reset(self): self.targs,self.preds = [],[]
@@ -29,9 +30,11 @@ class AccumMetric(Metric):
         pred = learn.pred.argmax(dim=self.dim_argmax) if self.dim_argmax else learn.pred
         if self.sigmoid: pred = torch.sigmoid(pred)
         if self.thresh:  pred = (pred >= self.thresh)
-        pred,targ = flatten_check(pred, learn.y)
-        self.preds.append(to_detach(pred))
-        self.targs.append(to_detach(targ))
+        targ = learn.y
+        pred,targ = to_detach(pred),to_detach(targ)
+        if self.flatten: pred,targ = flatten_check(pred,targ)
+        self.preds.append(pred)
+        self.targs.append(targ)
 
     @property
     def value(self):
@@ -149,8 +152,8 @@ def Recall(axis=-1, labels=None, pos_label=1, average='binary', sample_weight=No
 #Cell
 def RocAuc(axis=-1, average='macro', sample_weight=None, max_fpr=None):
     "Area Under the Receiver Operating Characteristic Curve for single-label binary classification problems"
-    return skm_to_fastai(skm.recall_score, axis=axis,
-                         laverage=average, sample_weight=sample_weight, max_fpr=max_fpr)
+    return skm_to_fastai(skm.roc_auc_score, axis=axis,
+                         average=average, sample_weight=sample_weight, max_fpr=max_fpr)
 
 #Cell
 class Perplexity(AvgLoss):

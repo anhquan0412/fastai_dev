@@ -13,12 +13,12 @@ from .optimizer import *
 #Cell
 class Callback(GetAttr):
     "Basic class handling tweaks of the training loop by changing a `Learner` in various events"
-    _default,learn = 'learn',None
+    _default,learn,run = 'learn',None,True
     def __repr__(self): return type(self).__name__
 
     def __call__(self, event_name):
         "Call `self.{event_name}` if it's defined"
-        getattr(self, event_name, noop)()
+        if self.run: getattr(self, event_name, noop)()
 
     @property
     def name(self):
@@ -37,7 +37,7 @@ class TrainEvalCallback(Callback):
         "Update the iter counter (in training mode)"
         if not self.training: return
         self.learn.pct_train += 1./(self.n_iter*self.n_epoch)
-        self.learn.train_iter   += 1
+        self.learn.train_iter += 1
 
     def begin_train(self):
         "Set the model in training mode"
@@ -51,9 +51,18 @@ class TrainEvalCallback(Callback):
         self.learn.training=False
 
 #Cell
+def _maybe_reduce(val):
+    if num_distrib()>1:
+        val = val.clone()
+        torch.distributed.all_reduce(val, op=torch.distributed.ReduceOp.SUM)
+        val /= num_distrib()
+    return val
+
+#Cell
 class GatherPredsCallback(Callback):
     "`Callback` that saves the predictions and targets, optionally `with_loss`"
-    def __init__(self, with_input=False, with_loss=False): store_attr(self, "with_input,with_loss")
+    def __init__(self, with_input=False, with_loss=False, save_preds=None, save_targs=None):
+        store_attr(self, "with_input,with_loss,save_preds,save_targs")
 
     def begin_batch(self):
         if self.with_input: self.inputs.append((to_detach(self.xb)))
@@ -61,13 +70,21 @@ class GatherPredsCallback(Callback):
     def begin_validate(self):
         "Initialize containers"
         self.preds,self.targets = [],[]
-        if self.with_input: self.inputs=[]
-        if self.with_loss: self.losses = []
+        if self.with_input: self.inputs = []
+        if self.with_loss:  self.losses = []
 
     def after_batch(self):
         "Save predictions, targets and potentially losses"
-        self.preds.append(to_detach(self.pred))
-        self.targets.append(to_detach(self.yb))
+        preds = to_detach(self.pred)
+        if self.save_preds is None: self.preds.append(preds)
+        else:
+            (self.save_preds/str(self.iter)).save_array(preds)
+#             self.preds.append(preds[0][None])
+        targs = to_detach(self.yb)
+        if self.save_targs is None: self.targets.append(targs)
+        else:
+            (self.save_targs/str(self.iter)).save_array(targs[0])
+#             self.targets.append(targs[0][None])
         if self.with_loss:
             bs = find_bs(self.yb)
             loss = self.loss if self.loss.numel() == bs else self.loss.view(bs,-1).mean(1)
@@ -137,17 +154,15 @@ def load_model(file, model, opt, with_opt=None, device=None, strict=True):
 
 #Cell
 def _try_concat(o):
-    try:
-        return torch.cat(o)
-    except:
-        return sum([L(o_[i,:] for i in range_of(o_)) for o_ in o], L())
+    try:    return torch.cat(o)
+    except: return sum([L(o_[i,:] for i in range_of(o_)) for o_ in o], L())
 
 #Cell
 class Learner():
-    def __init__(self, dbunch, model, loss_func=None, opt_func=SGD, lr=defaults.lr, splitter=trainable_params, cbs=None,
+    def __init__(self, dbunch, model, loss_func=None, opt_func=Adam, lr=defaults.lr, splitter=trainable_params, cbs=None,
                  cb_funcs=None, metrics=None, path=None, model_dir='models', wd_bn_bias=False, train_bn=True):
         store_attr(self, "dbunch,model,opt_func,lr,splitter,model_dir,wd_bn_bias,train_bn,metrics")
-        self.training,self.logger,self.opt,self.cbs = False,print,None,L()
+        self.training,self.create_mbar,self.logger,self.opt,self.cbs = False,True,print,None,L()
         #TODO: infer loss_func from data
         if loss_func is None:
             loss_func = getattr(dbunch.train_ds, 'loss_func', None)
@@ -157,6 +172,7 @@ class Learner():
         self.add_cbs(cbf() for cbf in L(defaults.callbacks)+L(cb_funcs))
         self.add_cbs(cbs)
         self.model.to(self.dbunch.device)
+        self.epoch,self.n_epoch,self.loss = 0,1,tensor(0.)
 
     @property
     def metrics(self): return self._metrics
@@ -195,9 +211,9 @@ class Learner():
     def create_opt(self):
         self.opt = self.opt_func(self.splitter(self.model), lr=self.lr)
         if not self.wd_bn_bias:
-            for p in self._bn_bias_state(True ): p['do_wd'] = False
+            for p in self._bn_bias_state(False): p['do_wd'] = False
         if self.train_bn:
-            for p in self._bn_bias_state(False): p['force_train'] = True
+            for p in self._bn_bias_state(True ): p['force_train'] = True
 
     def _split(self, b):
         i = getattr(self.dbunch, 'n_inp', 1 if len(b)==1 else len(b)-1)
@@ -233,11 +249,14 @@ class Learner():
 
     def _do_epoch_validate(self, ds_idx=1, dl=None):
         if dl is None: dl = self.dbunch.dls[ds_idx]
+        names = ['shuffle', 'drop_last']
         try:
+            dl,old,has = change_attrs(dl, names, [False,False])
             self.dl = dl;                                    self('begin_validate')
             with torch.no_grad(): self.all_batches()
         except CancelValidException:                         self('after_cancel_validate')
-        finally:                                             self('after_validate')
+        finally:
+            dl,*_ = change_attrs(dl, names, old, has);       self('after_validate')
 
     def fit(self, n_epoch, lr=None, wd=defaults.wd, cbs=None, reset_opt=False):
         with self.added_cbs(cbs):
@@ -258,27 +277,31 @@ class Learner():
             finally:                               self('after_fit')
 
     def validate(self, ds_idx=1, dl=None, cbs=None):
-        self.epoch,self.n_epoch,self.loss = 0,1,tensor(0.)
+        #self.epoch,self.n_epoch,self.loss = 0,1,tensor(0.)
         if dl is None: dl = self.dbunch.dls[ds_idx]
-        with self.added_cbs(cbs), self.no_logging():
+        with self.added_cbs(cbs), self.no_logging(), self.no_mbar():
             self(_before_epoch)
             self._do_epoch_validate(ds_idx, dl)
             self(_after_epoch)
         return self.recorder.values[-1]
 
-    def get_preds(self, ds_idx=1, dl=None, with_input=False, with_loss=False, with_decoded=False, act=None):
-        self.epoch,self.n_epoch,self.loss = 0,1,tensor(0.)
-        cb = GatherPredsCallback(with_input=with_input, with_loss=with_loss)
-        with self.no_logging(), self.added_cbs(cb), self.loss_not_reduced():
+    def get_preds(self, ds_idx=1, dl=None, with_input=False, with_loss=False, with_decoded=False, act=None,
+                 save_preds=None, save_targs=None):
+        #self.epoch,self.n_epoch,self.loss = 0,1,tensor(0.)
+        cb = GatherPredsCallback(with_input=with_input, with_loss=with_loss, save_preds=save_preds, save_targs=save_targs)
+        with self.no_logging(), self.added_cbs(cb), self.loss_not_reduced(), self.no_mbar():
             self(_before_epoch)
             self._do_epoch_validate(ds_idx, dl)
             self(_after_epoch)
             if act is None: act = getattr(self.loss_func, 'activation', noop)
-            preds = act(torch.cat(cb.preds))
-            res = (preds, detuplify(tuple(torch.cat(o) for o in zip(*cb.targets))))
-            if with_decoded: res = res + (getattr(self.loss_func, 'decodes', noop)(preds),)
-            if with_input: res = (tuple(_try_concat(o) for o in zip(*cb.inputs)),) + res
-            if with_loss:  res = res + (torch.cat(cb.losses),)
+            res = []
+            if len(cb.preds):
+                preds = act(torch.cat(cb.preds))
+                res.append(preds)
+                if with_decoded: res.append(getattr(self.loss_func, 'decodes', noop)(preds))
+            res.append(detuplify(tuple(torch.cat(o) for o in zip(*cb.targets))))
+            if with_input: res = [tuple(_try_concat(o) for o in zip(*cb.inputs))] + res
+            if with_loss:  res.append(torch.cat(cb.losses))
             return res
 
     def predict(self, item, rm_type_tfms=0):
@@ -311,6 +334,8 @@ class Learner():
 
     @contextmanager
     def no_logging(self): return replacing_yield(self, 'logger', noop)
+    @contextmanager
+    def no_mbar(self):    return replacing_yield(self, 'create_mbar', False)
 
     @contextmanager
     def loss_not_reduced(self):
@@ -318,13 +343,14 @@ class Learner():
         else: return replacing_yield(self, 'loss_func', partial(self.loss_func, reduction='none'))
 
     def save(self, file, with_opt=True):
-        #TODO: if rank_distrib(): return # don't save if slave proc
+        if rank_distrib(): return # don't save if slave proc
         file = join_path_file(file, self.path/self.model_dir, ext='.pth')
         save_model(file, self.model, getattr(self,'opt',None), with_opt)
 
     def load(self, file, with_opt=None, device=None, strict=True):
         if device is None: device = self.dbunch.device
         if self.opt is None: self.create_opt()
+        distrib_barrier()
         file = join_path_file(file, self.path/self.model_dir, ext='.pth')
         load_model(file, self.model, self.opt, with_opt=with_opt, device=device, strict=strict)
         return self
@@ -349,6 +375,7 @@ add_docs(Learner, "Group together a `model`, some `dbunch` and a `loss_func` to 
     show_results="Show some predictions on `ds_idx`-th dbunchset or `dl`",
     show_training_loop="Show each step in the training loop",
     no_logging="Context manager to temporarily remove `logger`",
+    no_mbar="Context manager to temporarily prevent the master progress bar from being created",
     loss_not_reduced="A context manager to evaluate `loss_func` with reduction set to none.",
     save="Save model and optimizer state (if `with_opt`) to `self.path/self.model_dir/file`",
     load="Load model and optimizer state (if `with_opt`) from `self.path/self.model_dir/file` using `device`"
@@ -378,6 +405,14 @@ class Metric():
         name="Name of the `Metric`, camel-cased and with Metric removed",
         accumulate="Use `learn` to update the state with new results",
         value="The value of the metric")
+
+#Cell
+def _maybe_reduce(val):
+    if num_distrib()>1:
+        val = val.clone()
+        torch.distributed.all_reduce(val, op=torch.distributed.ReduceOp.SUM)
+        val /= num_distrib()
+    return val
 
 #Cell
 class AvgMetric(Metric):
@@ -413,7 +448,7 @@ class AvgSmoothLoss(Metric):
     def reset(self):               self.count,self.val = 0,tensor(0.)
     def accumulate(self, learn):
         self.count += 1
-        self.val = torch.lerp(to_detach(learn.loss.mean()), self.val, self.beta)
+        self.val = torch.lerp(to_detach(learn.loss.mean(), gather=False), self.val, self.beta)
     @property
     def value(self): return self.val/(1-self.beta**self.count)
 
@@ -484,9 +519,10 @@ class Recorder(Callback):
         return L(self.loss) + self.metrics
 
     def plot_loss(self, skip_start=5, with_valid=True):
-        plt.plot(self.losses[skip_start:], label='train')
+        plt.plot(list(range(skip_start, len(self.losses))), self.losses[skip_start:], label='train')
         if with_valid:
-            plt.plot(self.iters, L(self.values).itemgot(0), label='valid')
+            idx = (np.array(self.iters)<skip_start).sum()
+            plt.plot(self.iters[idx:], L(self.values[idx:]).itemgot(1), label='valid')
             plt.legend()
 
 #Cell
@@ -506,6 +542,7 @@ defaults.callbacks = [TrainEvalCallback, Recorder]
 def freeze_to(self:Learner, n):
     if self.opt is None: self.create_opt()
     self.opt.freeze_to(n)
+    self.opt.clear_state()
 
 @patch
 def freeze(self:Learner): self.freeze_to(-1)
@@ -517,3 +554,39 @@ add_docs(Learner,
          freeze_to="Freeze parameter groups up to `n`",
          freeze="Freeze up to last parameter group",
          unfreeze="Unfreeze the entire model")
+
+#Cell
+@patch
+def export(self:Learner, fname='export.pkl'):
+    "Export the content of `self` without the items and the optimizer state for inference"
+    if rank_distrib(): return # don't export if slave proc
+    old_dbunch = self.dbunch
+    self.dbunch = self.dbunch.new_empty()
+    state = self.opt.state_dict()
+    self.opt = None
+    with warnings.catch_warnings():
+        #To avoid the warning that come from PyTorch about model not being checked
+        warnings.simplefilter("ignore")
+        torch.save(self, self.path/fname)
+    self.create_opt()
+    self.opt.load_state_dict(state)
+    self.dbunch = old_dbunch
+
+#Cell
+@patch
+def tta(self:Learner, ds_idx=1, dl=None, n=4, item_tfms=None, batch_tfms=None, beta=0.25):
+    "Return predictions on the `ds_idx` dataset or `dl` using Test Time Augmentation"
+    if dl is None: dl = self.dbunch.dls[ds_idx]
+    if item_tfms is not None or batch_tfms is not None: dl = dl.new(after_item=item_tfms, after_batch=batch_tfms)
+    with dl.dataset.set_split_idx(0), self.no_mbar():
+        if hasattr(self,'progress'): self.progress.mbar = master_bar(list(range(n)))
+        aug_preds = []
+        for i in self.progress.mbar if hasattr(self,'progress') else range(n):
+            self.epoch = i #To keep track of progress on mbar since the progress callback will use self.epoch
+#             aug_preds.append(self.get_preds(dl=dl)[0][None])
+            aug_preds.append(self.get_preds(ds_idx)[0][None])
+    aug_preds = torch.cat(aug_preds).mean(0)
+    self.epoch = n
+    with dl.dataset.set_split_idx(1): preds,targs = self.get_preds(ds_idx)
+    preds = (aug_preds,preds) if beta is None else torch.lerp(aug_preds, preds, beta)
+    return preds,targs

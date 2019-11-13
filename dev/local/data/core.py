@@ -10,7 +10,7 @@ from .load import *
 
 #Cell
 @typedispatch
-def show_batch(x, y, samples, ctxs=None, max_n=10, **kwargs):
+def show_batch(x, y, samples, ctxs=None, max_n=9, **kwargs):
     if ctxs is None: ctxs = Inf.nones
     for i in range_of(samples[0]):
         ctxs = [b.show(ctx=c, **kwargs) for b,c,_ in zip(samples.itemgot(i),ctxs,range(max_n))]
@@ -18,7 +18,7 @@ def show_batch(x, y, samples, ctxs=None, max_n=10, **kwargs):
 
 #Cell
 @typedispatch
-def show_results(x, y, samples, outs, ctxs=None, max_n=10, **kwargs):
+def show_results(x, y, samples, outs, ctxs=None, max_n=9, **kwargs):
     if ctxs is None: ctxs = Inf.nones
     for i in range(len(samples[0])):
         ctxs = [b.show(ctx=c, **kwargs) for b,c,_ in zip(samples.itemgot(i),ctxs,range(max_n))]
@@ -59,33 +59,33 @@ class TfmdDL(DataLoader):
             if isinstance(f,Pipeline): f.split_idx=split_idx
 
     def decode(self, b): return self.before_batch.decode(self.after_batch.decode(self._retain_dl(b)))
-    def decode_batch(self, b, max_n=10, full=True): return self._decode_batch(self.decode(b), max_n, full)
+    def decode_batch(self, b, max_n=9, full=True): return self._decode_batch(self.decode(b), max_n, full)
 
-    def _decode_batch(self, b, max_n=10, full=True):
+    def _decode_batch(self, b, max_n=9, full=True):
         f = self.after_item.decode
         f = compose(f, partial(getattr(self.dataset,'decode',noop), full = full))
         return L(batch_to_samples(b, max_n=max_n)).map(f)
 
-    def _pre_show_batch(self, b, max_n=10):
+    def _pre_show_batch(self, b, max_n=9):
+        "Decode `b` to be ready for `show_batch`"
         b = self.decode(b)
         if hasattr(b, 'show'): return b,None,None
         its = self._decode_batch(b, max_n, full=False)
         if not is_listy(b): b,its = [b],L((o,) for o in its)
         return detuplify(b[:self.n_inp]),detuplify(b[self.n_inp:]),its
 
-    def show_batch(self, b=None, max_n=10, ctxs=None, **kwargs):
-        "Show `b` (defaults to `one_batch`), a list of lists of pipeline outputs (i.e. output of a `DataLoader`)"
+    def show_batch(self, b=None, max_n=9, ctxs=None, show=True, **kwargs):
         if b is None: b = self.one_batch()
+        if not show: return self._pre_show_batch(b, max_n=max_n)
         show_batch(*self._pre_show_batch(b, max_n=max_n), ctxs=ctxs, max_n=max_n, **kwargs)
 
-    def show_results(self, b, out, max_n=10, ctxs=None, **kwargs):
-        x,y,its = self._pre_show_batch(b, max_n=max_n)
+    def show_results(self, b, out, max_n=9, ctxs=None, show=True, **kwargs):
+        x,y,its = self.show_batch(b, max_n=max_n, show=False)
         b_out = b[:self.n_inp] + (tuple(out) if is_listy(out) else (out,))
-        x1,y1,outs = self._pre_show_batch(b_out, max_n=max_n)
-        if its is not None:
-            show_results(x, y, its, outs.itemgot(slice(self.n_inp,None)), ctxs=ctxs, max_n=max_n, **kwargs)
-        #its None means that a batch knows how to show itself as a whole, so we pass x, x1
-        else: show_results(x, x1, its, outs, ctxs=ctxs, max_n=max_n, **kwargs)
+        x1,y1,outs = self.show_batch(b_out, max_n=max_n, show=False)
+        res = (x,x1,None,None) if its is None else (x, y, its, outs.itemgot(slice(self.n_inp,None)))
+        if not show: return res
+        show_results(*res, ctxs=ctxs, max_n=max_n, **kwargs)
 
     @property
     def device(self):
@@ -104,17 +104,28 @@ class DataBunch(GetAttr):
     "Basic wrapper around several `DataLoader`s."
     _default='train_dl'
 
-    def __init__(self, *dls): self.dls = dls
+    def __init__(self, *dls, path='.'): self.dls,self.path = dls,Path(path)
     def __getitem__(self, i): return self.dls[i]
+
+    def new_empty(self):
+        dls = [dl.new(dl.dataset.new_empty()) for dl in self.dls]
+        return type(self)(*dls)
 
     train_dl,valid_dl = add_props(lambda i,x: x[i])
     train_ds,valid_ds = add_props(lambda i,x: x[i].dataset)
 
+    @classmethod
+    @delegates(TfmdDL.__init__)
+    def from_dblock(cls, dblock, source, path='.', type_tfms=None, item_tfms=None, batch_tfms=None, **kwargs):
+        return dblock.databunch(source, path=path, type_tfms=type_tfms, item_tfms=item_tfms, batch_tfms=batch_tfms, **kwargs)
+
     _docs=dict(__getitem__="Retrieve `DataLoader` at `i` (`0` is training, `1` is validation)",
-              train_dl="Training `DataLoader`",
-              valid_dl="Validation `DataLoader`",
-              train_ds="Training `Dataset`",
-              valid_ds="Validation `Dataset`")
+               train_dl="Training `DataLoader`",
+               valid_dl="Validation `DataLoader`",
+               train_ds="Training `Dataset`",
+               valid_ds="Validation `Dataset`",
+               new_empty="Create a new empty version of `self` with the same transforms",
+               from_dblock="Create a databunch from a given `dblock`")
 
 #Cell
 class FilteredBase:
@@ -130,20 +141,22 @@ class FilteredBase:
     def _new(self, items, **kwargs): return super()._new(items, splits=self.splits, **kwargs)
     def subset(self): raise NotImplemented
 
-    def databunch(self, bs=16, val_bs=None, shuffle_train=True, n=None, dl_type=None, dl_kwargs=None, **kwargs):
+    def databunch(self, bs=16, val_bs=None, shuffle_train=True, n=None, path='.', dl_type=None, dl_kwargs=None, **kwargs):
         if dl_kwargs is None: dl_kwargs = [{}] * self.n_subsets
         ns = self.n_subsets-1
-        bss = [bs] + [2*bs]*ns if val_bs is None else [bs] + [val_bs]*ns
+        bss = ([None]*(ns+1) if bs is None
+               else [bs] + [3*bs//2]*ns if val_bs is None
+               else [bs] + [val_bs]*ns)
         shuffles = [shuffle_train] + [False]*ns
         if dl_type is None: dl_type = self._dl_type
         dls = [dl_type(self.subset(i), bs=b, shuffle=s, drop_last=s, n=n if i==0 else None, **kwargs, **dk)
                for i,(b,s,dk) in enumerate(zip(bss,shuffles,dl_kwargs))]
-        return DataBunch(*dls)
+        return DataBunch(*dls, path=path)
 
-FilteredBase.train,FilteredBase.valid = add_props(lambda i,x: x.subset(i), 2)
+FilteredBase.train,FilteredBase.valid = add_props(lambda i,x: x.subset(i))
 
 #Cell
-class TfmdList(FilteredBase, L):
+class TfmdList(FilteredBase, L, GetAttr):
     "A `Pipeline` of `tfms` applied to a collection of `items`"
     _default='tfms'
     def __init__(self, items, tfms, use_list=None, do_setup=True, as_item=True, split_idx=None, train_setup=True, splits=None):
@@ -160,8 +173,8 @@ class TfmdList(FilteredBase, L):
     def __repr__(self): return f"{self.__class__.__name__}: {self.items}\ntfms - {self.tfms.fs}"
     def __iter__(self): return (self[i] for i in range(len(self)))
     def show(self, o, **kwargs): return self.tfms.show(o, **kwargs)
-    def decode(self, x, **kwargs): return self.tfms.decode(x, **kwargs)
-    def __call__(self, x, **kwargs): return self.tfms.__call__(x, **kwargs)
+    def decode(self, o, **kwargs): return self.tfms.decode(o, **kwargs)
+    def __call__(self, o, **kwargs): return self.tfms.__call__(o, **kwargs)
     def setup(self, train_setup=True): self.tfms.setup(getattr(self,'train',self) if train_setup else self)
     def overlapping_splits(self): return L(Counter(self.splits.concat()).values()).filter(gt(1))
 
@@ -209,17 +222,34 @@ class DataSource(FilteredBase):
     def split_idx(self): return self.tls[0].tfms.split_idx
     @property
     def items(self): return self.tls[0].items
+    @items.setter
+    def items(self, v):
+        for tl in self.tls: tl.items = v
 
     def show(self, o, ctx=None, **kwargs):
         for o_,tl in zip(o,self.tls): ctx = tl.show(o_, ctx=ctx, **kwargs)
         return ctx
+
+    def new_empty(self):
+        tls = [tl._new([self.items[0]], split_idx=tl.split_idx) for tl in self.tls]
+        return type(self)(tls=tls, n_inp=self.n_inp)
+
+    @contextmanager
+    def set_split_idx(self, i):
+        old_split_idx = self.split_idx
+        for tl in self.tls: tl.tfms.split_idx = i
+        yield self
+        for tl in self.tls: tl.tfms.split_idx = old_split_idx
 
     _docs=dict(
         decode="Compose `decode` of all `tuple_tfms` then all `tfms` on `i`",
         show="Show item `o` in `ctx`",
         databunch="Get a `DataBunch`",
         overlapping_splits="All splits that are in more than one split",
-        subset="New `DataSource` that only includes subset `i`")
+        subset="New `DataSource` that only includes subset `i`",
+        new_empty="Create a new empty version of the `self`, keeping only the transforms",
+        set_split_idx="Contextmanager to use the same `DataSource` with another `split_idx`"
+    )
 
 #Cell
 def test_set(dsrc, test_items, rm_tfms=0):

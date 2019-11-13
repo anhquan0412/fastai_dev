@@ -38,15 +38,18 @@ class TrackerCallback(Callback):
 
     def begin_fit(self):
         "Prepare the monitored value"
+        self.run = not hasattr(self, "lr_finder")
         self.best = float('inf') if self.comp == np.less else -float('inf')
         assert self.monitor in self.recorder.metric_names[1:]
-        self.idx = self.recorder.metric_names[1:].index(self.monitor)
+        self.idx = list(self.recorder.metric_names[1:]).index(self.monitor)
 
     def after_epoch(self):
         "Compare the last value to the best up to know"
         val = self.recorder.values[-1][self.idx]
         if self.comp(val - self.min_delta, self.best): self.best,self.new_best = val,True
         else: self.new_best = False
+
+    def after_fit(self): self.run=True
 
 #Cell
 class EarlyStoppingCallback(TrackerCallback):
@@ -69,21 +72,25 @@ class EarlyStoppingCallback(TrackerCallback):
 #Cell
 class SaveModelCallback(TrackerCallback):
     "A `TrackerCallback` that saves the model's best during training and loads it at the end."
-    def __init__(self, monitor='valid_loss', comp=None, min_delta=0., fname='model', every_epoch=False):
+    def __init__(self, monitor='valid_loss', comp=None, min_delta=0., fname='model', every_epoch=False, add_save=None, with_opt=False):
         super().__init__(monitor=monitor, comp=comp, min_delta=min_delta)
-        store_attr(self, 'fname,every_epoch')
+        store_attr(self, 'fname,every_epoch,add_save,with_opt')
+
+    def _save(self, name):
+        self.learn.save(name, with_opt=self.with_opt)
+        if self.add_save is not None:
+            with self.add_save.open('wb') as f: self.learn.save(f, with_opt=self.with_opt)
 
     def after_epoch(self):
         "Compare the value monitored to its best score and save if best."
-        if self.every_epoch: self.learn.save(f'{self.fname}_{self.epoch}')
+        if self.every_epoch: self._save(f'{self.fname}_{self.epoch}')
         else: #every improvement
             super().after_epoch()
-            if self.new_best: self.learn.save(f'{self.fname}')
+            if self.new_best: self._save(f'{self.fname}')
 
     def on_train_end(self, **kwargs):
         "Load the best model."
-        if not self.every_epoch and (self.learn.path/f'{self.learn.model_dir}/{self.fname}.pth').is_file():
-            self.learn.load(f'{self.fname}')
+        if not self.every_epoch: self.learn.load(f'{self.fname}')
 
 #Cell
 class ReduceLROnPlateau(TrackerCallback):
